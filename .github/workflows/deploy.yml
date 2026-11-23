@@ -1,157 +1,170 @@
 
-name: CI and deploy
+name: STECIA Frontend CI and Deployment
 
 on:
   push:
-    branches: [main]
-  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Prevent overlapping production deployments.
 concurrency:
-  group: stecia-frontend-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: stecia-frontend-production
+  cancel-in-progress: false
 
 jobs:
   build-and-deploy:
+    name: Build and Deploy
     runs-on: [self-hosted, linux, x64, stecia-frontend]
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     env:
       IMAGE: stecia-frontend:${{ github.sha }}
+      LATEST_IMAGE: stecia-frontend:latest
       ROLLBACK_IMAGE: stecia-frontend:rollback
       COMPOSE_PROJECT: stecia-frontend
       SITE_PORT: ${{ vars.SITE_PORT || '5000' }}
-      PUBLIC_HOST: ${{ vars.PUBLIC_HOST }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Validate configuration
+      - name: Validate deployment configuration
+        shell: bash
         run: |
+          set -euo pipefail
+
           if ! [[ "$SITE_PORT" =~ ^[0-9]+$ ]] ||
-             [ "$SITE_PORT" -lt 1 ] ||
-             [ "$SITE_PORT" -gt 65535 ]; then
-            echo "::error::Invalid SITE_PORT."
+             (( SITE_PORT < 1 || SITE_PORT > 65535 )); then
+            echo "::error::SITE_PORT must be a valid port between 1 and 65535."
             exit 1
           fi
 
-          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ] &&
-             [ -z "$PUBLIC_HOST" ]; then
-            echo "::error::Set PUBLIC_HOST in GitHub Actions Variables."
-            exit 1
-          fi
+          echo "Deployment port: $SITE_PORT"
+
+      - name: Check Docker availability
+        run: |
+          docker info
+          docker compose version
+
+      - name: Validate Docker Compose configuration
+        run: |
+          docker compose -p "$COMPOSE_PROJECT" config --quiet
 
       - name: Build Docker image
         run: |
           docker build --pull -t "$IMAGE" .
 
-      - name: Smoke test
+      - name: Test Docker image
+        shell: bash
         run: |
-          set -Eeuo pipefail
+          set -euo pipefail
 
-          cid=$(docker run -d --rm "$IMAGE")
+          TEST_CONTAINER="stecia-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           cleanup() {
-            docker stop "$cid" >/dev/null 2>&1 || true
+            docker rm -f "$TEST_CONTAINER" >/dev/null 2>&1 || true
           }
+
           trap cleanup EXIT
 
-          echo "Waiting for Nginx..."
+          docker run -d \
+            --name "$TEST_CONTAINER" \
+            "$IMAGE"
 
-          for i in $(seq 1 30); do
-            if docker exec "$cid" wget -qO- \
-              http://127.0.0.1:80/ 2>/dev/null |
-              grep -qi '<html'; then
-              echo "Smoke test passed."
+          echo "Waiting for Nginx to serve the website..."
+
+          for attempt in $(seq 1 30); do
+            if docker exec "$TEST_CONTAINER" \
+              wget -qO- http://127.0.0.1:80/ \
+              | grep -qi '<html'; then
+              echo "Image smoke test passed."
               exit 0
             fi
-            sleep 1
-          done
-
-          echo "::error::Smoke test failed."
-          docker logs "$cid" || true
-          docker exec "$cid" nginx -T 2>&1 || true
-          exit 1
-
-      - name: Deploy production
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-        run: |
-          set -Eeuo pipefail
-
-          export IMAGE
-
-          docker compose -p "$COMPOSE_PROJECT" config --quiet
-
-          CURRENT_CONTAINER=$(docker compose \
-            -p "$COMPOSE_PROJECT" ps -q web)
-
-          if [ -n "$CURRENT_CONTAINER" ]; then
-            CURRENT_IMAGE=$(docker inspect \
-              --format '{{.Image}}' "$CURRENT_CONTAINER")
-
-            docker image tag "$CURRENT_IMAGE" "$ROLLBACK_IMAGE"
-            echo "Previous production image preserved."
-          fi
-
-          if ! docker compose -p "$COMPOSE_PROJECT" \
-            up -d --no-build --remove-orphans; then
-
-            echo "::error::Deployment failed."
-
-            if docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
-              IMAGE="$ROLLBACK_IMAGE" docker compose \
-                -p "$COMPOSE_PROJECT" up -d --no-build
-            fi
-
-            exit 1
-          fi
-
-          URL="http://127.0.0.1:${SITE_PORT}/"
-          HEALTHY=false
-
-          for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null \
-              -w '%{http_code}' "$URL" || true)
-
-            case "$CODE" in
-              2*|3*)
-                HEALTHY=true
-                break
-                ;;
-            esac
 
             sleep 2
           done
 
-          if [ "$HEALTHY" != "true" ]; then
-            echo "::error::Production health check failed."
+          echo "::error::Container did not serve a valid HTML page."
+          docker logs "$TEST_CONTAINER"
+          exit 1
 
-            docker compose -p "$COMPOSE_PROJECT" logs --tail 100 || true
+      - name: Deploy to production
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
-            if docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
-              echo "Restoring previous production image..."
+          PREVIOUS_IMAGE=false
 
-              IMAGE="$ROLLBACK_IMAGE" docker compose \
-                -p "$COMPOSE_PROJECT" up -d --no-build
+          # Preserve the currently deployed image for rollback.
+          if docker image inspect "$LATEST_IMAGE" >/dev/null 2>&1; then
+            docker image tag "$LATEST_IMAGE" "$ROLLBACK_IMAGE"
+            PREVIOUS_IMAGE=true
+            echo "Previous production image saved."
+          else
+            echo "No previous production image found. This may be the first deployment."
+          fi
 
-              echo "Rollback attempted."
-            else
-              echo "::error::No previous production image available."
+          # Promote the tested image to the Compose image tag.
+          docker image tag "$IMAGE" "$LATEST_IMAGE"
+
+          # Deploy without rebuilding.
+          docker compose -p "$COMPOSE_PROJECT" up \
+            -d \
+            --no-build \
+            --remove-orphans
+
+          # Verify the deployed website through the host port.
+          echo "Checking production website..."
+
+          HEALTHY=false
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error \
+              "http://127.0.0.1:${SITE_PORT}/" \
+              | grep -qi '<html'; then
+              HEALTHY=true
+              break
             fi
 
-            exit 1
+            sleep 2
+          done
+
+          if [[ "$HEALTHY" == true ]]; then
+            echo "Production deployment successful."
+            exit 0
           fi
 
-          echo "Production deployment successful."
-          echo "Website: http://${PUBLIC_HOST}:${SITE_PORT}/"
+          echo "::error::Production health check failed."
 
-      - name: Clean up old CI images
-        if: always()
+          # Restore the previous image if one exists.
+          if [[ "$PREVIOUS_IMAGE" == true ]]; then
+            echo "Rolling back to the previous production image..."
+
+            docker image tag "$ROLLBACK_IMAGE" "$LATEST_IMAGE"
+
+            docker compose -p "$COMPOSE_PROJECT" up \
+              -d \
+              --no-build \
+              --remove-orphans
+
+            echo "Rollback command completed."
+          else
+            echo "No previous image is available for rollback."
+          fi
+
+          exit 1
+
+      - name: Deployment summary
+        if: success() && github.ref == 'refs/heads/main'
         run: |
-          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
-            docker image rm -f "$IMAGE" 2>/dev/null || true
-          fi
+          echo "## STECIA Frontend Deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Status: Successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: $IMAGE" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Port: $SITE_PORT" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
