@@ -1,11 +1,3 @@
-# Runs on the self-hosted runner on the VPS (user gh-runner, docker group).
-#
-# Every push and pull request: build the site image to check it builds.
-# Pushes to main (or a manual run on main): deploy with Docker Compose.
-#
-# Configuration (Settings > Secrets and variables > Actions > Variables):
-#   PUBLIC_HOST - the VPS IP or host name, e.g. 13.140.213.149
-#   SITE_PORT   - optional host port for the site (default 5000)
 
 name: CI and deploy
 
@@ -19,75 +11,147 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: stecia-frontend-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build:
-    runs-on: self-hosted
-    timeout-minutes: 15
+  build-and-deploy:
+    runs-on: [self-hosted, linux, x64, stecia-frontend]
+    timeout-minutes: 20
+
     env:
-      IMAGE: stecia-frontend-ci:${{ github.run_id }}
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Build image
-        run: docker build -t "$IMAGE" .
-
-      - name: Smoke test
-        run: |
-          cid=$(docker run -d --rm "$IMAGE")
-          trap 'docker stop "$cid" >/dev/null' EXIT
-          for _ in $(seq 1 10); do
-            if docker exec "$cid" wget -qO- http://localhost/ | grep -qi '<html'; then
-              echo "Site serves index.html"; exit 0
-            fi
-            sleep 1
-          done
-          echo "::error::Container did not serve index.html"
-          docker logs "$cid" || true
-          exit 1
-
-      - name: Remove CI image
-        if: always()
-        run: docker image rm -f "$IMAGE" || true
-
-  deploy:
-    needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    runs-on: self-hosted
-    timeout-minutes: 15
-    concurrency:
-      group: deploy-production
-      cancel-in-progress: false
-    env:
-      PUBLIC_HOST: ${{ vars.PUBLIC_HOST }}
+      IMAGE: stecia-frontend:${{ github.sha }}
+      ROLLBACK_IMAGE: stecia-frontend:rollback
+      COMPOSE_PROJECT: stecia-frontend
       SITE_PORT: ${{ vars.SITE_PORT || '5000' }}
-    steps:
-      - uses: actions/checkout@v5
+      PUBLIC_HOST: ${{ vars.PUBLIC_HOST }}
 
-      - name: Check configuration
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Validate configuration
         run: |
-          if [ -z "$PUBLIC_HOST" ]; then
-            echo "::error::Set the repository variable PUBLIC_HOST (Settings > Secrets and variables > Actions > Variables) to the VPS IP."
+          if ! [[ "$SITE_PORT" =~ ^[0-9]+$ ]] ||
+             [ "$SITE_PORT" -lt 1 ] ||
+             [ "$SITE_PORT" -gt 65535 ]; then
+            echo "::error::Invalid SITE_PORT."
             exit 1
           fi
 
-      - name: Deploy site
-        run: docker compose -p stecia-frontend up -d --build --remove-orphans
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ] &&
+             [ -z "$PUBLIC_HOST" ]; then
+            echo "::error::Set PUBLIC_HOST in GitHub Actions Variables."
+            exit 1
+          fi
 
-      - name: Wait for the site to respond
+      - name: Build Docker image
         run: |
-          url="http://localhost:${SITE_PORT}/"
-          for _ in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || true)
-            case "$code" in 2*|3*) echo "$url -> $code"; echo "Live at http://${PUBLIC_HOST}:${SITE_PORT}/"; exit 0;; esac
-            sleep 2
+          docker build --pull -t "$IMAGE" .
+
+      - name: Smoke test
+        run: |
+          set -Eeuo pipefail
+
+          cid=$(docker run -d --rm "$IMAGE")
+
+          cleanup() {
+            docker stop "$cid" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          echo "Waiting for Nginx..."
+
+          for i in $(seq 1 30); do
+            if docker exec "$cid" wget -qO- \
+              http://127.0.0.1:80/ 2>/dev/null |
+              grep -qi '<html'; then
+              echo "Smoke test passed."
+              exit 0
+            fi
+            sleep 1
           done
-          echo "::error::$url did not respond (last status: ${code:-none})"
-          docker compose -p stecia-frontend logs --tail 80 || true
+
+          echo "::error::Smoke test failed."
+          docker logs "$cid" || true
+          docker exec "$cid" nginx -T 2>&1 || true
           exit 1
 
-      - name: Clean up old images
+      - name: Deploy production
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          set -Eeuo pipefail
+
+          export IMAGE
+
+          docker compose -p "$COMPOSE_PROJECT" config --quiet
+
+          CURRENT_CONTAINER=$(docker compose \
+            -p "$COMPOSE_PROJECT" ps -q web)
+
+          if [ -n "$CURRENT_CONTAINER" ]; then
+            CURRENT_IMAGE=$(docker inspect \
+              --format '{{.Image}}' "$CURRENT_CONTAINER")
+
+            docker image tag "$CURRENT_IMAGE" "$ROLLBACK_IMAGE"
+            echo "Previous production image preserved."
+          fi
+
+          if ! docker compose -p "$COMPOSE_PROJECT" \
+            up -d --no-build --remove-orphans; then
+
+            echo "::error::Deployment failed."
+
+            if docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
+              IMAGE="$ROLLBACK_IMAGE" docker compose \
+                -p "$COMPOSE_PROJECT" up -d --no-build
+            fi
+
+            exit 1
+          fi
+
+          URL="http://127.0.0.1:${SITE_PORT}/"
+          HEALTHY=false
+
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null \
+              -w '%{http_code}' "$URL" || true)
+
+            case "$CODE" in
+              2*|3*)
+                HEALTHY=true
+                break
+                ;;
+            esac
+
+            sleep 2
+          done
+
+          if [ "$HEALTHY" != "true" ]; then
+            echo "::error::Production health check failed."
+
+            docker compose -p "$COMPOSE_PROJECT" logs --tail 100 || true
+
+            if docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
+              echo "Restoring previous production image..."
+
+              IMAGE="$ROLLBACK_IMAGE" docker compose \
+                -p "$COMPOSE_PROJECT" up -d --no-build
+
+              echo "Rollback attempted."
+            else
+              echo "::error::No previous production image available."
+            fi
+
+            exit 1
+          fi
+
+          echo "Production deployment successful."
+          echo "Website: http://${PUBLIC_HOST}:${SITE_PORT}/"
+
+      - name: Clean up old CI images
         if: always()
-        run: docker image prune -f
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            docker image rm -f "$IMAGE" 2>/dev/null || true
+          fi
